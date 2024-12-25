@@ -1,6 +1,10 @@
-from utils import get_vector_store
+import utils
+from models import ResponseModel
 
+import re
+import ast
 import os
+import asyncio
 from dotenv import load_dotenv
 
 from langchain_core.tools import tool
@@ -8,13 +12,13 @@ from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, MessagesState
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.mongodb import MongoDBSaver
 
 
 @tool(response_format='content_and_artifact')
 def retrieve(query: str):
     """Retrieve information related to a query"""
-    retrieved_docs = vector_store.similarity_search(query, k=3)
+    retrieved_docs = vector_store.similarity_search(query, k=int(os.getenv('NUM_DOCUMENTS')))
     serialised = '\n\n'.join(f'Source: {doc.metadata}\nContent: {doc.page_content}' for doc in retrieved_docs)
     return serialised, retrieved_docs
 
@@ -58,7 +62,7 @@ def generate(state: MessagesState):
 load_dotenv()
 API_KEY = os.getenv('OPENAI_API_KEY')
 
-vector_store = get_vector_store()
+vector_store = utils.get_vector_store()
 
 model = ChatOpenAI(model='gpt-4o-mini', openai_api_key=API_KEY)
 graph_builder = StateGraph(MessagesState)
@@ -72,48 +76,51 @@ graph_builder.add_conditional_edges('query_or_respond', tools_condition, {END: E
 graph_builder.add_edge('tools', 'generate')
 graph_builder.add_edge('generate', END)
 
-# graph = graph_builder.compile()
-graph = graph_builder.compile(checkpointer=MemorySaver())
-config = {"configurable": {"thread_id": "abc123"}}
+checkpointer = MongoDBSaver(utils.get_client())
+graph = graph_builder.compile(checkpointer=checkpointer)
 
 
-def generate_response(query: str):
-    final_state = graph.invoke(
+async def generate_answer(query: str, thread_id: str):
+    final_state = await asyncio.to_thread(
+        graph.invoke,
         {'messages': [{'role': 'user', 'content': query}]},
-        config=config
+        config={'configurable': {'thread_id': thread_id}}
     )
 
     if len(final_state['messages']) < 2:
         raise RuntimeError('Length of the messages produced is less than 2')
 
     tool_msg = final_state['messages'][-2]
-    if not isinstance(tool_msg, ToolMessage):
-        file = None
-        page = None
-    else:
-        try:
-            start_idx = tool_msg.content.index("'source': '")
-            end_idx = tool_msg.content.index(',', start_idx)
-            file = tool_msg.content[start_idx + 11: end_idx]
-        except ValueError:
-            file = None
+    context = []
 
-        try:
-            start_idx = tool_msg.content.index("'page': ")
-            end_idx = tool_msg.content.index(',', start_idx)
-            page = int(tool_msg.content[start_idx + 8: end_idx]) + 1
-        except ValueError:
-            page = None
+    if isinstance(tool_msg, ToolMessage):
+        src = tool_msg.content
+        pattern = r'Source:\s*({.*?})'
+        matches = re.findall(pattern, src)
+        if matches:
+            dict_list = [ast.literal_eval(match) for match in matches]
+            for elem in dict_list:
+                if 'source' not in elem or 'page' not in elem:
+                    continue
+                context.append((elem['source'], elem['page'] + 1))
 
     ai_msg = final_state['messages'][-1]
     if not isinstance(ai_msg, AIMessage):
         raise RuntimeError('Last message was not of type AIMessage')
 
-    response = ai_msg.content
+    answer = ai_msg.content
+    context.sort()
+    if context:
+        files, pages = zip(*context)
+    else:
+        files, pages = [], []
 
-    return {'file': file, 'page': page, 'response': response}
+    return ResponseModel(files=files, pages=pages, answer=answer)
 
 
-if __name__ == '__main__':
-    print(generate_response("Give a very short summary of Sumpton vs Hoffman"))
-    print(generate_response("What was my previous question?"))
+def clear_thread_id_history(thread_id: str):
+    client = utils.get_client()
+    checkpoint_writes_collection = client['checkpointing_db']['checkpoint_writes']
+    checkpoints_collection = client['checkpointing_db']['checkpoints']
+    checkpoint_writes_collection.delete_many({'thread_id': thread_id})
+    checkpoints_collection.delete_many({'thread_id': thread_id})
