@@ -1,0 +1,9 @@
+notes
+.DS_Store
+.env
+.idea
+__pycache__
+login_details.yaml
+test.py
+generate_password.py
+add_user.py
